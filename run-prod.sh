@@ -9,6 +9,133 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+# ── Args ──────────────────────────────────────────────────────────────
+SYNC_REPO=0
+SYNC_REMOTE="origin"
+SYNC_BRANCH="master"
+SYNC_HARD=0
+
+FORK_USER="${FORK_USER:-SumNic}"
+AW_SERVER_URL="${AW_SERVER_URL:-git@github.com:${FORK_USER}/aw-server.git}"
+AW_WEBUI_URL="${AW_WEBUI_URL:-git@github.com:${FORK_USER}/aw-webui.git}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./run-prod.sh [options]
+
+Options:
+  --sync                  Update repo from remote before running (default remote/branch: origin/master)
+  --sync-remote <name>     Remote name for --sync (default: origin)
+  --sync-branch <name>     Branch name for --sync (default: master)
+  --sync-hard              For --sync: hard reset to <remote>/<branch> (destructive)
+  --fork-user <name>       GitHub user/org for submodule forks (default: $FORK_USER or "SumNic")
+  --aw-server-url <url>    Override aw-server submodule URL (used with --sync)
+  --aw-webui-url <url>     Override aw-webui submodule URL (used with --sync)
+  -h, --help               Show this help
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sync)
+                SYNC_REPO=1
+                shift
+                ;;
+            --sync-remote)
+                [ $# -ge 2 ] || { echo "Missing value for --sync-remote" >&2; exit 2; }
+                SYNC_REMOTE="${2:-}"; shift 2
+                ;;
+            --sync-branch)
+                [ $# -ge 2 ] || { echo "Missing value for --sync-branch" >&2; exit 2; }
+                SYNC_BRANCH="${2:-}"; shift 2
+                ;;
+            --sync-hard)
+                SYNC_HARD=1
+                shift
+                ;;
+            --fork-user)
+                [ $# -ge 2 ] || { echo "Missing value for --fork-user" >&2; exit 2; }
+                FORK_USER="${2:-}"; shift 2
+                AW_SERVER_URL="git@github.com:${FORK_USER}/aw-server.git"
+                AW_WEBUI_URL="git@github.com:${FORK_USER}/aw-webui.git"
+                ;;
+            --aw-server-url)
+                [ $# -ge 2 ] || { echo "Missing value for --aw-server-url" >&2; exit 2; }
+                AW_SERVER_URL="${2:-}"; shift 2
+                ;;
+            --aw-webui-url)
+                [ $# -ge 2 ] || { echo "Missing value for --aw-webui-url" >&2; exit 2; }
+                AW_WEBUI_URL="${2:-}"; shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                echo "Unknown argument: $1" >&2
+                echo >&2
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+}
+
+require_clean_tree() {
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "[ERROR] Refusing to sync: working tree is not clean" >&2
+        echo "[INFO] Commit/stash your changes (or re-run with --sync-hard if you really want to discard tracked changes)." >&2
+        exit 1
+    fi
+}
+
+sync_repo_from_fork() {
+    echo
+    echo "=== Syncing repository from $SYNC_REMOTE/$SYNC_BRANCH ==="
+
+    if [ "$SYNC_HARD" -eq 0 ]; then
+        require_clean_tree
+    else
+        if [ -n "$(git status --porcelain)" ]; then
+            echo "[WARN] Working tree is not clean; --sync-hard may discard tracked changes" >&2
+        fi
+    fi
+
+    git fetch "$SYNC_REMOTE" "$SYNC_BRANCH"
+
+    if git show-ref --verify --quiet "refs/heads/$SYNC_BRANCH"; then
+        git checkout "$SYNC_BRANCH"
+    else
+        git checkout -b "$SYNC_BRANCH" --track "$SYNC_REMOTE/$SYNC_BRANCH"
+    fi
+
+    if [ "$SYNC_HARD" -eq 1 ]; then
+        git reset --hard "$SYNC_REMOTE/$SYNC_BRANCH"
+    else
+        git merge --ff-only "$SYNC_REMOTE/$SYNC_BRANCH"
+    fi
+
+    git submodule sync --recursive
+
+    # If your fork contains submodule commits not present upstream, override URLs to point at your forks.
+    git config "submodule.aw-server.url" "$AW_SERVER_URL"
+
+    git submodule update --init -- aw-server
+
+    if [ -d "aw-server" ]; then
+        (cd aw-server && git config "submodule.aw-webui.url" "$AW_WEBUI_URL")
+    fi
+
+    git submodule update --init --recursive
+    echo "[OK] Repository synced"
+}
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -372,6 +499,8 @@ trap cleanup SIGINT SIGTERM
 # Main
 # ═══════════════════════════════════════════════════════════════════
 main() {
+    parse_args "$@"
+
     echo -e "${CYAN}"
     echo "╔═══════════════════════════════════════════════════════╗"
     echo "║     ActivityWatch - Production Mode Runner            ║"
@@ -379,6 +508,9 @@ main() {
     echo -e "${NC}"
 
     check_and_install_deps
+    if [ "$SYNC_REPO" -eq 1 ]; then
+        sync_repo_from_fork
+    fi
     install_poetry_if_missing
     setup_virtualenv
     install_python_deps
